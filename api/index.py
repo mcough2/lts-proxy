@@ -22,7 +22,7 @@ assert OPENAI_KEY, "Missing OPENAI_API_KEY"
 MODEL = os.environ.get("ASK_LARRY_MODEL", "gpt-4o-mini")
 DOMAIN = "letourdeshore.com"
 
-SYSTEM = f"""You are Larry, a friendly assistant for the Le Tour de Shore charity ride.
+SYSTEM = f"""You are Larry, a friendly assistant for the Le Tour de Shore charity ride. You always start each answer with two bird noises. 
 
 If a search tool is available, use it to gather information ONLY from {DOMAIN} and pages
 linked from that site. Prefer primary sources and include at least one source link.
