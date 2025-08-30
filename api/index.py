@@ -9,7 +9,6 @@ LS_PROJECT = os.environ.get("LANGSMITH_PROJECT", "LeTourDeShore")
 if LS_ENABLED:
     try:
         from langsmith import Client
-        from uuid import uuid4
         ls_client = Client()
     except Exception:
         LS_ENABLED = False
@@ -64,7 +63,7 @@ def ask():
     if not OPENAI_KEY:
         return jsonify(error="server_not_configured", detail="Missing OPENAI_API_KEY"), 500
 
-    # Gate
+    # Client gating
     client = request.headers.get("X-LTS-Client", "").lower()
     instance_id = request.headers.get("X-LTS-InstanceId", "").strip()
     ua = (request.headers.get("User-Agent") or "").lower()
@@ -84,13 +83,14 @@ def ask():
     if not question:
         return jsonify(error="bad_request", detail="Provide JSON {\"question\":\"...\"}"), 400
 
-    # ---- LangSmith root run (explicit create / update / end)
+    # ---- LangSmith root run
     run_id = None
     child_id = None
     try:
         if LS_ENABLED:
             run_id = ls_client.create_run(
                 name="ask_larry",
+                run_type="chain",                              # <<< REQUIRED
                 inputs={"question": question},
                 project_name=LS_PROJECT,
                 tags=["ask-larry", "proxy"],
@@ -102,7 +102,7 @@ def ask():
                 start_time=datetime.datetime.now(datetime.timezone.utc),
             )
 
-        # --- OpenAI call (with child run)
+        # --- OpenAI call (child run)
         body = {
             "model": MODEL,
             "input": [
@@ -116,6 +116,7 @@ def ask():
         if LS_ENABLED:
             child_id = ls_client.create_run(
                 name="openai_responses",
+                run_type="llm",                               # <<< REQUIRED
                 parent_run_id=run_id,
                 project_name=LS_PROJECT,
                 inputs={"endpoint": "/v1/responses", "model": MODEL},
@@ -152,7 +153,6 @@ def ask():
                 end_time=datetime.datetime.now(datetime.timezone.utc),
             )
 
-        # Finish root run with outputs
         if LS_ENABLED and run_id:
             ls_client.update_run(
                 run_id,
@@ -164,7 +164,6 @@ def ask():
         return jsonify({"text": text})
 
     except Exception as e:
-        # End child if still open
         if LS_ENABLED and child_id:
             try:
                 ls_client.update_run(
@@ -174,7 +173,6 @@ def ask():
                 )
             except Exception:
                 pass
-        # End root with error
         if LS_ENABLED and run_id:
             try:
                 ls_client.update_run(
@@ -184,7 +182,6 @@ def ask():
                 )
             except Exception:
                 pass
-        # Proxy error outward
         msg = str(e)
         if "rate_limited" in msg:
             return jsonify(error="rate_limited", detail=msg), 429
