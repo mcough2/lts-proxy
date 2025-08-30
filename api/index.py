@@ -1,21 +1,19 @@
-import os, json, re, time
+import os, json, re, time, datetime
 from flask import Flask, request, jsonify
 import requests
 from collections import defaultdict, deque
 
-# ---- LangSmith (optional) ----
-LS_ENABLED = bool(
-    os.environ.get("LANGSMITH_API_KEY")
-    or os.environ.get("LANGCHAIN_API_KEY")  # back-compat
-)
+# ---- LangSmith (Client API) ----
+LS_ENABLED = bool(os.environ.get("LANGSMITH_API_KEY"))
 LS_PROJECT = os.environ.get("LANGSMITH_PROJECT", "LeTourDeShore")
-
 if LS_ENABLED:
     try:
-        # RunTree gives us explicit control (start/end, metadata, tags)
-        from langsmith.run_trees import RunTree
-    except Exception:  # fail open if package missing
+        from langsmith import Client
+        from uuid import uuid4
+        ls_client = Client()
+    except Exception:
         LS_ENABLED = False
+        ls_client = None
 
 app = Flask(__name__)
 
@@ -29,8 +27,8 @@ Prefer primary sources, and include at least one source link in every answer.
 Answer in concise Markdown."""
 
 # ---- Simple in-memory rate limiting (resets per cold start) ----
-RATE_LIMIT = 10         # requests
-RATE_WINDOW = 60        # seconds
+RATE_LIMIT = 10
+RATE_WINDOW = 60
 requests_log = defaultdict(lambda: deque())
 
 def is_rate_limited(key: str) -> bool:
@@ -43,17 +41,13 @@ def is_rate_limited(key: str) -> bool:
     q.append(now)
     return False
 
-# ---- Extract text from OpenAI response ----
 def parse_responses_text(payload: dict) -> str:
     out_parts = []
     for item in payload.get("output", []) or []:
         msg = item.get("message", {})
         if isinstance(msg, dict) and isinstance(msg.get("content"), list):
-            text = "\n".join(
-                [c.get("text", "") for c in msg["content"] if isinstance(c, dict) and c.get("text")]
-            ).strip()
-            if text:
-                out_parts.append(text)
+            text = "\n".join([c.get("text","") for c in msg["content"] if isinstance(c, dict) and c.get("text")]).strip()
+            if text: out_parts.append(text)
         for c in item.get("content", []) or []:
             if isinstance(c, dict) and c.get("text"):
                 out_parts.append(c["text"].strip())
@@ -61,45 +55,16 @@ def parse_responses_text(payload: dict) -> str:
         return "\n\n".join([p for p in out_parts if p])
     return payload.get("output_text") or payload.get("text", {}).get("value") or ""
 
-def start_trace(question: str, meta: dict):
-    """Start a LangSmith run (returns RunTree or None)."""
-    if not LS_ENABLED:
-        return None
-    try:
-        run = RunTree(
-            name="ask_larry",
-            project_name=LS_PROJECT,
-            inputs={"question": question},
-            tags=["ask-larry", "proxy"],
-            metadata=meta,
-        )
-        run.post()  # create the run in LangSmith
-        return run
-    except Exception:
-        return None
-
-def end_trace(run, *, outputs=None, error=None, extra_meta=None):
-    if run is None:
-        return
-    try:
-        if extra_meta:
-            run.update(metadata={**(run.metadata or {}), **extra_meta})
-        if error:
-            run.end(error=error)
-        else:
-            run.end(outputs=outputs or {})
-    except Exception:
-        pass
+def safe_trunc(s: str, n: int = 2000) -> str:
+    return s if len(s) <= n else s[:n] + "…"
 
 # ---- Main ask endpoint ----
 @app.post("/ask")
 def ask():
-    t_req_start = time.time()
-
     if not OPENAI_KEY:
         return jsonify(error="server_not_configured", detail="Missing OPENAI_API_KEY"), 500
 
-    # --- Basic client gating ---
+    # Gate
     client = request.headers.get("X-LTS-Client", "").lower()
     instance_id = request.headers.get("X-LTS-InstanceId", "").strip()
     ua = (request.headers.get("User-Agent") or "").lower()
@@ -110,39 +75,54 @@ def ask():
     if "mozilla" in ua or "safari" in ua or "chrome" in ua:
         return jsonify(error="forbidden", detail="Browser access blocked"), 403
 
-    # --- Rate limiting ---
     if is_rate_limited(instance_id):
         return jsonify(error="rate_limited",
                        detail=f"Exceeded {RATE_LIMIT} requests per {RATE_WINDOW}s"), 429
 
-    # --- Body validation ---
     data = request.get_json(silent=True) or {}
     question = (data.get("question") or "").strip()
     if not question:
         return jsonify(error="bad_request", detail="Provide JSON {\"question\":\"...\"}"), 400
 
-    # ---- LangSmith start ----
-    ls_meta = {
-        "client": client,
-        "instance_id": instance_id,
-        "user_agent": ua[:200],
-        "ip": ip,
-        "rate_limit": {"limit": RATE_LIMIT, "window_s": RATE_WINDOW},
-    }
-    run = start_trace(question, ls_meta)
-
-    # --- Build upstream request ---
-    body = {
-        "model": MODEL,
-        "input": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": question}
-        ],
-        "tools": [{"type": "web_search"}]
-    }
-
+    # ---- LangSmith root run (explicit create / update / end)
+    run_id = None
+    child_id = None
     try:
+        if LS_ENABLED:
+            run_id = ls_client.create_run(
+                name="ask_larry",
+                inputs={"question": question},
+                project_name=LS_PROJECT,
+                tags=["ask-larry", "proxy"],
+                metadata={
+                    "client": client, "instance_id": instance_id,
+                    "user_agent": ua[:200], "ip": ip,
+                    "rate_limit": {"limit": RATE_LIMIT, "window_s": RATE_WINDOW},
+                },
+                start_time=datetime.datetime.now(datetime.timezone.utc),
+            )
+
+        # --- OpenAI call (with child run)
+        body = {
+            "model": MODEL,
+            "input": [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": question}
+            ],
+            "tools": [{"type": "web_search"}]
+        }
+
         t_up = time.time()
+        if LS_ENABLED:
+            child_id = ls_client.create_run(
+                name="openai_responses",
+                parent_run_id=run_id,
+                project_name=LS_PROJECT,
+                inputs={"endpoint": "/v1/responses", "model": MODEL},
+                tags=["openai"],
+                start_time=datetime.datetime.now(datetime.timezone.utc),
+            )
+
         r = requests.post(
             "https://api.openai.com/v1/responses",
             headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"},
@@ -150,38 +130,64 @@ def ask():
             timeout=30,
         )
         upstream_latency = time.time() - t_up
-    except requests.RequestException as e:
-        end_trace(run, error=f"upstream_unreachable: {str(e)}",
-                  extra_meta={"upstream_latency_s": None})
-        return jsonify(error="upstream_unreachable", detail=str(e)), 502
 
-    if r.status_code // 100 != 2:
-        end_trace(
-            run,
-            error=f"openai_error {r.status_code}",
-            extra_meta={"upstream_latency_s": upstream_latency, "openai_body": safe_trunc(r.text)}
-        )
-        return jsonify(error="openai_error", status=r.status_code, detail=r.text), 502
+        if r.status_code // 100 != 2:
+            if LS_ENABLED and child_id:
+                ls_client.update_run(
+                    child_id,
+                    error=f"openai_error {r.status_code}",
+                    outputs={"status": r.status_code, "body": safe_trunc(r.text)},
+                    end_time=datetime.datetime.now(datetime.timezone.utc),
+                )
+            raise RuntimeError(f"openai_error {r.status_code}: {r.text}")
 
-    payload = r.json()
-    text = parse_responses_text(payload)
-    # Optional polish: remove dangling "(letourdeshore.com)" if present at the very end
-    text = re.sub(r"\s*\((?:https?://)?(?:www\.)?letourdeshore\.com\)\s*$", "", text).strip()
+        payload = r.json()
+        text = parse_responses_text(payload)
+        text = re.sub(r"\s*\((?:https?://)?(?:www\.)?letourdeshore\.com\)\s*$", "", text).strip()
 
-    total_latency = time.time() - t_req_start
+        if LS_ENABLED and child_id:
+            ls_client.update_run(
+                child_id,
+                outputs={"latency_s": upstream_latency, "model": payload.get("model") or MODEL},
+                end_time=datetime.datetime.now(datetime.timezone.utc),
+            )
 
-    # ---- LangSmith end ----
-    end_trace(
-        run,
-        outputs={"text": text},
-        extra_meta={
-            "upstream_latency_s": upstream_latency,
-            "total_latency_s": total_latency,
-            "openai_model": payload.get("model") or MODEL
-        }
-    )
+        # Finish root run with outputs
+        if LS_ENABLED and run_id:
+            ls_client.update_run(
+                run_id,
+                outputs={"text": text},
+                metadata={"upstream_latency_s": upstream_latency},
+                end_time=datetime.datetime.now(datetime.timezone.utc),
+            )
 
-    return jsonify({"text": text})
+        return jsonify({"text": text})
 
-def safe_trunc(s: str, n: int = 2000) -> str:
-    return s if len(s) <= n else s[:n] + "…"
+    except Exception as e:
+        # End child if still open
+        if LS_ENABLED and child_id:
+            try:
+                ls_client.update_run(
+                    child_id,
+                    error=str(e),
+                    end_time=datetime.datetime.now(datetime.timezone.utc),
+                )
+            except Exception:
+                pass
+        # End root with error
+        if LS_ENABLED and run_id:
+            try:
+                ls_client.update_run(
+                    run_id,
+                    error=str(e),
+                    end_time=datetime.datetime.now(datetime.timezone.utc),
+                )
+            except Exception:
+                pass
+        # Proxy error outward
+        msg = str(e)
+        if "rate_limited" in msg:
+            return jsonify(error="rate_limited", detail=msg), 429
+        if "openai_error" in msg:
+            return jsonify(error="openai_error", detail=msg), 502
+        return jsonify(error="proxy_error", detail=msg), 502
