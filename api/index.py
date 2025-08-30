@@ -102,7 +102,7 @@ def ask():
                     "rate_limit": {"limit": RATE_LIMIT, "window_s": RATE_WINDOW},
                 },
             )
-            run.post()  # <-- create run in LangSmith
+            run.post()  # create run
 
         # ---- OpenAI call (child run)
         body = {
@@ -134,21 +134,32 @@ def ask():
                 timeout=30,
             )
         except requests.RequestException as e:
-            if child: 
-                child.end(error=f"upstream_unreachable: {str(e)}")
+            if child:
+                try: child.end(error=f"upstream_unreachable: {str(e)}")
+                except Exception: pass
             if run:
-                run.end(error=f"upstream_unreachable: {str(e)}")
+                try: run.end(error=f"upstream_unreachable: {str(e)}")
+                except Exception: pass
             return jsonify(error="upstream_unreachable", detail=str(e)), 502
 
         upstream_latency = time.time() - t0
 
         if r.status_code // 100 != 2:
             if child:
-                child.end(error=f"openai_error {r.status_code}",
-                          outputs={"status": r.status_code, "body": safe_trunc(r.text)})
+                try:
+                    child.end(
+                        error=f"openai_error {r.status_code}",
+                        outputs={"status": r.statusCode if hasattr(r, 'statusCode') else r.status_code,
+                                 "body": safe_trunc(r.text)}
+                    )
+                except Exception:
+                    pass
             if run:
-                run.update(metadata={**(run.metadata or {}), "upstream_latency_s": upstream_latency})
-                run.end(error=f"openai_error {r.status_code}")
+                try:
+                    run.end(error=f"openai_error {r.status_code}",
+                            metadata={"upstream_latency_s": upstream_latency})
+                except Exception:
+                    pass
             return jsonify(error="openai_error", status=r.status_code, detail=r.text), 502
 
         payload = r.json()
@@ -156,23 +167,29 @@ def ask():
         text = re.sub(r"\s*\((?:https?://)?(?:www\.)?letourdeshore\.com\)\s*$", "", text).strip()
 
         if child:
-            child.end(outputs={"latency_s": upstream_latency,
-                               "model": payload.get("model") or MODEL})
+            try:
+                child.end(outputs={"latency_s": upstream_latency,
+                                   "model": payload.get("model") or MODEL})
+            except Exception:
+                pass
 
         if run:
-            run.update(metadata={**(run.metadata or {}), "upstream_latency_s": upstream_latency})
-            run.end(outputs={"text": text})
+            try:
+                run.end(outputs={"text": text},
+                        metadata={"upstream_latency_s": upstream_latency})
+            except Exception:
+                pass
 
         return jsonify({"text": text})
 
     except Exception as e:
-        # Always close runs on error paths
+        # Always try to close any open runs
         try:
-            if child and not child.ended: child.end(error=str(e))
+            if child: child.end(error=str(e))
         except Exception:
             pass
         try:
-            if run and not run.ended: run.end(error=str(e))
+            if run: run.end(error=str(e))
         except Exception:
             pass
         return jsonify(error="proxy_error", detail=str(e)), 502
