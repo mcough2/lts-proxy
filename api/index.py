@@ -23,6 +23,7 @@ app = Flask(__name__)
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
 if not OPENAI_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
+ASK_LARRY_MODEL = "gpt-5-nano"
 
 MODEL  = os.environ.get("ASK_LARRY_MODEL", "gpt-4o-mini")
 DOMAIN = "letourdeshore.com"
