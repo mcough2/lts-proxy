@@ -1,21 +1,22 @@
-# index.py — Ask Larry proxy using LangChain + LangSmith with explicit flush
+# index.py — Ask Larry proxy with reliable LangSmith outputs
 import os, re, time, datetime
 from collections import defaultdict, deque
 from flask import Flask, request, jsonify
 
-# --- LangSmith: force synchronous callbacks to avoid "Incomplete" runs on serverless
-os.environ.setdefault("LANGSMITH_TRACING_V2", "true")              # enable tracing if not set
-os.environ.setdefault("LANGSMITH_CALLBACKS_BACKGROUND", "false")   # flush inline, not in a bg thread
+# --- LangSmith: make callbacks synchronous (no bg thread that can be killed early)
+os.environ.setdefault("LANGSMITH_TRACING_V2", "true")
+os.environ.setdefault("LANGSMITH_CALLBACKS_BACKGROUND", "false")
 
 # ---- LangChain / OpenAI ----
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# ---- LangSmith helpers ----
-from langsmith import traceable, Client
+# ---- LangSmith client (to create a concrete tracer and flush it)
+from langsmith import Client
+from langsmith import traceable  # for a nice root run around the handler
 
-# Optional: domain-limited web search (enable with TAVILY_API_KEY)
+# Optional: domain-limited search (set TAVILY_API_KEY to enable)
 USE_TAVILY = bool(os.environ.get("TAVILY_API_KEY"))
 if USE_TAVILY:
     from langchain_community.tools.tavily_search import TavilySearchResults
@@ -44,12 +45,12 @@ say so and suggest where to look on {DOMAIN}.
 # ------------------ In-memory rate limit (resets on cold start) ------------------
 RATE_LIMIT  = int(os.environ.get("ASK_LARRY_RATE_LIMIT", "10"))
 RATE_WINDOW = int(os.environ.get("ASK_LARRY_RATE_WINDOW", "60"))
-_requests_log: dict[str, list[float]] = defaultdict(list)
+_reqlog: dict[str, list[float]] = defaultdict(list)
 
 def is_rate_limited(key: str) -> bool:
     now = time.time()
     window_start = now - RATE_WINDOW
-    q = _requests_log[key]
+    q = _reqlog[key]
     while q and q[0] < window_start:
         q.pop(0)
     if len(q) >= RATE_LIMIT:
@@ -57,12 +58,12 @@ def is_rate_limited(key: str) -> bool:
     q.append(now)
     return False
 
-# ------------------ Build chain/agent once ------------------
+# ------------------ Build the chain/agent once ------------------
 def build_chain():
     llm = ChatOpenAI(
         model=MODEL,
         temperature=0.3,
-        timeout=45,                     # a bit higher to avoid timeouts cutting traces
+        timeout=45,
         openai_api_key=OPENAI_KEY,
     )
 
@@ -87,22 +88,21 @@ CHAIN = build_chain()
 
 # ------------------ Helpers ------------------
 def polish_markdown(md: str) -> str:
-    # remove trailing "(letourdeshore.com)" echoes
     return re.sub(r"\s*\((?:https?://)?(?:www\.)?letourdeshore\.com\)\s*$", "", (md or "")).strip()
 
-# Root run — this guarantees LangSmith has a single run that *ends* on return.
 @traceable(name="ask_larry", run_type="chain")
-def run_ask_larry(question: str, model: str) -> str:
-    # ^ inputs appear in LangSmith. You’ll also see the internal RunnableSequence tool calls.
+def run_ask_larry(question: str, tracer) -> str:
+    """
+    Root-traced function. We pass an explicit LangSmith tracer into the chain so
+    the ChatOpenAI child run gets tied to THIS request and flushed synchronously.
+    """
     if USE_TAVILY:
         # AgentExecutor expects {"input": "..."}; returns dict with "output"
-        result = CHAIN.invoke({"input": question})
+        result = CHAIN.invoke({"input": question}, config={"callbacks": [tracer]})
         text = result["output"] if isinstance(result, dict) and "output" in result else str(result)
     else:
-        text = CHAIN.invoke({"question": question})
-    text = polish_markdown(text)
-    # You can also return metadata via a structured output if desired; the run still closes.
-    return text
+        text = CHAIN.invoke({"question": question}, config={"callbacks": [tracer]})
+    return polish_markdown(text)
 
 # ------------------ Health ------------------
 @app.get("/healthz")
@@ -137,15 +137,17 @@ def ask():
     if not question:
         return jsonify(error="bad_request", detail='Provide JSON {"question":"..."}'), 400
 
-    ls = Client()  # to explicitly flush at the end
+    # Create a concrete tracer *for this request* and pass it to the chain
+    ls = Client()
+    tracer = ls.get_langchain_tracer()
+
     try:
-        text = run_ask_larry(question=question, model=MODEL)
+        text = run_ask_larry(question=question, tracer=tracer)
         return jsonify({"text": text})
     except Exception as e:
-        # Surface a clean error but still try to close/flush the trace
         return jsonify(error="proxy_error", detail=str(e)), 502
     finally:
-        # Critical for Vercel/other serverless: push any queued spans *before* returning
+        # Make sure all spans (including ChatOpenAI output) are uploaded now
         try:
             ls.flush()
         except Exception:
