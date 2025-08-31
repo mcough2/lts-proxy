@@ -1,6 +1,6 @@
-Flask
-requests
-langchain>=0.2.15
-langchain-openai>=0.1.23
-langchain-community>=0.2.15
-tavily-python>=0.3.5
+langchain>=0.2.11
+langchain-openai>=0.1.22
+langsmith>=0.1.64
+flask
+langchain-community
+tavily-python

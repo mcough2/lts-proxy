@@ -13,56 +13,30 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# --- LangSmith: version-agnostic tracer + explicit flush ---------------------
+# --- LangSmith (decorator + explicit flush; no callbacks) --------------------
+from langsmith import traceable
+
 _LS_ENABLED = bool(os.environ.get("LANGSMITH_API_KEY"))
-_LS_CLIENT = None  # lazily created only if enabled
-
-
-def _make_tracer():
-    """Create a LangSmith tracer across client versions, or return None."""
-    if not _LS_ENABLED:
-        return None
-    global _LS_CLIENT
-    # Make a client once (also gives us .flush()).
-    if _LS_CLIENT is None:
-        try:
-            from langsmith import Client  # type: ignore
-            _LS_CLIENT = Client()
-        except Exception:
-            _LS_CLIENT = None
-
-    # Try modern helper first
+_LS_CLIENT = None
+if _LS_ENABLED:
     try:
-        from langsmith.run_helpers import get_langchain_tracer  # type: ignore
-        return get_langchain_tracer()
+        from langsmith import Client  # type: ignore
+        _LS_CLIENT = Client()
     except Exception:
-        pass
-
-    # Fallback to older LangChain tracer
-    try:
-        from langchain.callbacks.tracers import LangChainTracer  # type: ignore
-        tracer = LangChainTracer()
-        try:
-            tracer.load_default_session()  # older API; ignore if absent
-        except Exception:
-            pass
-        return tracer
-    except Exception:
-        return None
+        _LS_CLIENT = None
 
 
 def _flush_traces_safely():
-    """Ensure traces are uploaded before the process exits."""
+    """Ensure traces are uploaded before the process exits (serverless-safe)."""
     if _LS_CLIENT is None:
         return
     try:
-        # Newer clients expose flush(); older may no-op or raise—ignore errors.
         _LS_CLIENT.flush()  # type: ignore[attr-defined]
     except Exception:
         pass
 
 
-# --- Optional Tavily search (bind tools only if enabled) ---------------------
+# --- Optional Tavily (tooling disabled by default; enable via env) ----------
 try:
     from langchain_community.tools.tavily_search import TavilySearchResults
     TAVILY_AVAILABLE = True
@@ -80,9 +54,7 @@ ASK_LARRY_MODEL = os.environ.get("ASK_LARRY_MODEL", "gpt-4o-mini")
 RATE_LIMIT = int(os.environ.get("ASK_LARRY_RATE_LIMIT", "10"))
 RATE_WINDOW_SECONDS = int(os.environ.get("ASK_LARRY_RATE_WINDOW", "60"))
 
-# Simple in-memory rate limiter (reset on cold start, fine for serverless)
 _rate_buckets: Dict[str, List[float]] = defaultdict(list)
-
 BROWSER_UA_PAT = re.compile(r"(mozilla|safari|chrome|edge|firefox)", re.I)
 
 # --------------------------------------------------------------------------------------
@@ -101,7 +73,6 @@ def _is_browser_user_agent() -> bool:
     return bool(BROWSER_UA_PAT.search(ua))
 
 def _enforce_ios_only() -> Optional[tuple]:
-    # Block obvious browsers & require our app headers
     if _is_browser_user_agent():
         return jsonify(error="forbidden", reason="browser_access_blocked"), 403
     if request.headers.get("X-LTS-Client", "").lower() != "ios":
@@ -114,7 +85,6 @@ def _rate_limit() -> Optional[tuple]:
     now = time.time()
     key = _client_id_from_headers()
     bucket = _rate_buckets[key]
-    # drop old events
     cutoff = now - RATE_WINDOW_SECONDS
     while bucket and bucket[0] < cutoff:
         bucket.pop(0)
@@ -131,32 +101,34 @@ def _rate_limit() -> Optional[tuple]:
     return None
 
 def _build_chain():
-    """
-    Build the LCEL chain. Tools are off by default; enable with ENABLE_TOOLS=1.
-    """
+    """Build LCEL chain. Tools off by default; enable with ENABLE_TOOLS=1."""
     system = (
         "You are Larry, the friendly ride assistant for the Le Tour De Shore iOS app. "
         "Answer clearly in concise Markdown. If you're unsure, say so briefly."
     )
     prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system),
-            ("human", "{question}"),
-        ]
+        [("system", system), ("human", "{question}")]
     )
 
-    # Add a conservative timeout to avoid hanging runs in serverless.
+    # Conservative timeout to avoid hanging in serverless
     llm = ChatOpenAI(model=ASK_LARRY_MODEL, temperature=0.3, timeout=20)
 
     if ENABLE_TOOLS and TAVILY_AVAILABLE and os.environ.get("TAVILY_API_KEY"):
         search = TavilySearchResults(k=3)
         llm = llm.bind_tools([search])
 
-    chain = prompt | llm | StrOutputParser()
-    return chain
+    return prompt | llm | StrOutputParser()
 
 def _polish(text: str) -> str:
     return text.strip()
+
+# --------------------------------------------------------------------------------------
+# Traced run (no callbacks; closes synchronously)
+# --------------------------------------------------------------------------------------
+@traceable(name="ask_larry", run_type="chain")
+def _run_larry(question: str) -> str:
+    chain = _build_chain()
+    return _polish(chain.invoke({"question": question}))
 
 # --------------------------------------------------------------------------------------
 # Health
@@ -177,7 +149,6 @@ def healthz():
 # --------------------------------------------------------------------------------------
 @app.post("/ask")
 def ask():
-    # Gate & rate-limit first
     gate = _enforce_ios_only()
     if gate:
         return gate
@@ -185,7 +156,6 @@ def ask():
     if rl:
         return rl
 
-    # Validate payload
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
     question = (payload.get("question") or "").strip()
     if not question:
@@ -193,27 +163,18 @@ def ask():
 
     try:
         _require_openai_key()
-
-        chain = _build_chain()
-
-        tracer = _make_tracer()
-        config = {"callbacks": [tracer]} if tracer else None
-
-        text = chain.invoke({"question": question}, config=config)
-        resp: Response = jsonify({"text": _polish(text)})
-
-        # IMPORTANT: flush traces before returning in serverless
-        _flush_traces_safely()
+        text = _run_larry(question)
+        resp: Response = jsonify({"text": text})
         return resp
-
     except Exception as e:
         app.logger.exception("ask failed")
-        resp_err: Response = jsonify(error="proxy_error", detail=str(e)), 502
+        return jsonify(error="proxy_error", detail=str(e)), 502
+    finally:
+        # Ensure traces upload before the serverless process freezes
         _flush_traces_safely()
-        return resp_err
 
 # --------------------------------------------------------------------------------------
-# Flask entry (local dev)
+# Local dev entry
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "3000")), debug=True)
