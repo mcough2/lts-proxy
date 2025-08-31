@@ -4,7 +4,7 @@ import time
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from flask import Flask, request, jsonify
 
@@ -13,11 +13,33 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# --- LangSmith (tracing) ---
-from langsmith import traceable
-from langsmith.run_helpers import get_langchain_tracer  # <-- correct import
+# --- LangSmith: version-agnostic tracer shim ---------------------------------
+# Newer langsmith exposes get_langchain_tracer in run_helpers.
+# Older stacks need LangChainTracer from langchain.callbacks.tracers.
+def _make_tracer():
+    # Respect env – only create tracer when LANGSMITH_API_KEY is set.
+    if not os.environ.get("LANGSMITH_API_KEY"):
+        return None
+    # Try modern import first
+    try:
+        from langsmith.run_helpers import get_langchain_tracer  # type: ignore
+        return get_langchain_tracer()
+    except Exception:
+        pass
+    # Fallback: older LangChain tracer class
+    try:
+        from langchain.callbacks.tracers import LangChainTracer  # type: ignore
+        tracer = LangChainTracer()
+        # Older tracer may require loading default session; ignore if not present
+        try:
+            tracer.load_default_session()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return tracer
+    except Exception:
+        return None
 
-# --- Optional Tavily search (used only if key is present) ---
+# Optional Tavily search (used only if key is present)
 try:
     from langchain_community.tools.tavily_search import TavilySearchResults
     TAVILY_AVAILABLE = True
@@ -33,11 +55,10 @@ ASK_LARRY_MODEL = os.environ.get("ASK_LARRY_MODEL", "gpt-4o-mini")
 RATE_LIMIT = int(os.environ.get("ASK_LARRY_RATE_LIMIT", "10"))
 RATE_WINDOW_SECONDS = int(os.environ.get("ASK_LARRY_RATE_WINDOW", "60"))
 
-USE_LANGSMITH = bool(os.environ.get("LANGSMITH_API_KEY"))
 USE_TAVILY = bool(os.environ.get("TAVILY_API_KEY")) and TAVILY_AVAILABLE
 
 # Simple in-memory rate limiter (reset on cold start, fine for serverless)
-_rate_buckets: Dict[str, list[float]] = defaultdict(list)
+_rate_buckets: Dict[str, List[float]] = defaultdict(list)
 
 BROWSER_UA_PAT = re.compile(r"(mozilla|safari|chrome|edge|firefox)", re.I)
 
@@ -49,7 +70,6 @@ def _require_openai_key():
         raise RuntimeError("OPENAI_API_KEY not configured")
 
 def _client_id_from_headers() -> str:
-    # Required headers from the iOS app
     instance_id = request.headers.get("X-LTS-InstanceId", "").strip()
     return instance_id or request.remote_addr or "unknown"
 
@@ -105,16 +125,13 @@ def _build_chain():
     llm = ChatOpenAI(model=ASK_LARRY_MODEL, temperature=0.3)
 
     if USE_TAVILY:
-        # Lightweight, top-3 web search when the model asks for it
         search = TavilySearchResults(k=3)
-        # Bind tool for function-calling models; model will decide when to call
         llm = llm.bind_tools([search])
 
     chain = prompt | llm | StrOutputParser()
     return chain
 
 def _polish(text: str) -> str:
-    # Tiny post-processor to keep things tidy for the chat bubble
     return text.strip()
 
 # --------------------------------------------------------------------------------------
@@ -128,13 +145,12 @@ def healthz():
         model=ASK_LARRY_MODEL,
         tools=("tavily" if USE_TAVILY else "none"),
         rate={"limit": RATE_LIMIT, "window_seconds": RATE_WINDOW_SECONDS},
-        tracing=("on" if USE_LANGSMITH else "off"),
+        tracing=("on" if os.environ.get("LANGSMITH_API_KEY") else "off"),
     )
 
 # --------------------------------------------------------------------------------------
 # Ask Larry
 # --------------------------------------------------------------------------------------
-@traceable(name="ask_larry_handler", run_type="chain")
 @app.post("/ask")
 def ask():
     # Gate & rate-limit first
@@ -154,11 +170,9 @@ def ask():
     try:
         _require_openai_key()
 
-        # Build chain once per invocation (fast enough for serverless)
         chain = _build_chain()
 
-        # LangSmith tracer is a function, not a Client method
-        tracer = get_langchain_tracer() if USE_LANGSMITH else None
+        tracer = _make_tracer()
         config = {"callbacks": [tracer]} if tracer else None
 
         text = chain.invoke({"question": question}, config=config)
@@ -169,8 +183,7 @@ def ask():
         return jsonify(error="proxy_error", detail=str(e)), 502
 
 # --------------------------------------------------------------------------------------
-# Flask entry (Vercel discovers app automatically)
+# Flask entry (local dev)
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Local dev only
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "3000")), debug=True)
