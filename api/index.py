@@ -1,43 +1,33 @@
 # api/index.py
-# --------------------------------------------------------------------
-# Tracing: we WANT traces, but we do NOT want auto-LCEL background
-# uploads that get stuck on serverless. So we disable auto tracing and
-# create/finish a run explicitly, then flush synchronously.
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
+# Tracing: We WANT LCEL (v2) call tree. We also want reliability
+# on Vercel, so we force synchronous uploads and flush explicitly.
+# ---------------------------------------------------------------
 import os
 
-# Kill auto LCEL tracing so it can't spawn background runs that hang.
-for _k in (
-    "LANGCHAIN_TRACING_V2",
-    "LANGCHAIN_TRACING",
-    "LANGCHAIN_ENDPOINT",
-    "LANGCHAIN_PROJECT",
-    "LANGSMITH_TRACING",
-    "LANGSMITH_ENDPOINT",
-):
-    os.environ.pop(_k, None)
+# ✅ Enable LCEL tracing v2 (waterfall)
+os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+# Put traces in your project (set the same in Vercel env too if you like)
+os.environ.setdefault("LANGCHAIN_PROJECT", "Le Tour De Shore")
 
-# Force synchronous uploads for our explicit runs
+# ✅ Avoid background uploader (serverless-safe)
 os.environ.setdefault("LANGSMITH_BATCH_UPLOADS", "false")
 
 import time
 import re
-from uuid import uuid4
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 from flask import Flask, request, jsonify, Response
 
-# ---- LangChain / OpenAI (the actual LLM call) ----------------------
+# ----- LangChain / OpenAI (LCEL) ---------------------------------
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# ---- LangSmith (explicit runs; no decorators/callbacks) ------------
+# ----- LangSmith client for explicit flush -----------------------
 _LS_ENABLED = bool(os.environ.get("LANGSMITH_API_KEY"))
-_LS_PROJECT = os.environ.get("LANGSMITH_PROJECT", "Le Tour De Shore")
-
 _LS_CLIENT = None
 if _LS_ENABLED:
     try:
@@ -46,46 +36,15 @@ if _LS_ENABLED:
     except Exception:
         _LS_CLIENT = None
 
-
-def _start_run(name: str, inputs: Dict[str, Any]) -> Optional[str]:
-    """Create a LangSmith run via low-level API; return run_id or None."""
-    if not (_LS_ENABLED and _LS_CLIENT):
-        return None
-    try:
-        run_id = str(uuid4())
-        _LS_CLIENT.create_run(
-            id=run_id,
-            name=name,
-            inputs=inputs,
-            run_type="chain",
-            start_time=datetime.now(timezone.utc),
-            project_name=_LS_PROJECT,
-        )
-        return run_id
-    except Exception:
-        return None
-
-
-def _finish_run(run_id: Optional[str], outputs: Optional[Dict[str, Any]] = None, error: Optional[str] = None):
-    """Finish the run and flush synchronously so serverless doesn't freeze uploads."""
-    if not (_LS_ENABLED and _LS_CLIENT and run_id):
+def _flush_traces():
+    if not _LS_CLIENT:
         return
     try:
-        _LS_CLIENT.update_run(
-            run_id,
-            end_time=datetime.now(timezone.utc),
-            outputs=outputs,
-            error=error,
-        )
-        try:
-            _LS_CLIENT.flush()  # may be a no-op on older clients; safe to try
-        except Exception:
-            pass
+        _LS_CLIENT.flush()  # ensure uploads complete before freeze
     except Exception:
         pass
 
-
-# ---- Optional Tavily tools (off by default; enable with env) -------
+# ----- Optional Tavily tools (off by default) --------------------
 try:
     from langchain_community.tools.tavily_search import TavilySearchResults
     TAVILY_AVAILABLE = True
@@ -94,23 +53,21 @@ except Exception:
 
 ENABLE_TOOLS = os.environ.get("ENABLE_TOOLS", "0") in ("1", "true", "TRUE")
 
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
 # App config
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
 app = Flask(__name__)
 
 ASK_LARRY_MODEL = os.environ.get("ASK_LARRY_MODEL", "gpt-4o-mini")
 RATE_LIMIT = int(os.environ.get("ASK_LARRY_RATE_LIMIT", "10"))
 RATE_WINDOW_SECONDS = int(os.environ.get("ASK_LARRY_RATE_WINDOW", "60"))
 
-# simple in-memory limiter (fine for serverless cold starts)
 _rate_buckets: Dict[str, List[float]] = defaultdict(list)
 BROWSER_UA_PAT = re.compile(r"(mozilla|safari|chrome|edge|firefox)", re.I)
 
-
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
 # Helpers
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
 def _require_openai_key():
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY not configured")
@@ -146,14 +103,16 @@ def _rate_limit() -> Optional[tuple]:
     return None
 
 def _build_chain():
-    """LCEL chain. Tools off by default; enable with ENABLE_TOOLS=1 + TAVILY_API_KEY."""
+    """
+    LCEL pipeline -> produces node-level traces when TRACING_V2=true.
+    """
     system = (
         "You are Larry, the friendly ride assistant for the Le Tour De Shore iOS app. "
         "Answer clearly in concise Markdown. If you're unsure, say so briefly."
     )
     prompt = ChatPromptTemplate.from_messages([("system", system), ("human", "{question}")])
 
-    # Add a conservative timeout so runs don't hang in serverless
+    # Conservative timeout so calls don't hang in serverless
     llm = ChatOpenAI(model=ASK_LARRY_MODEL, temperature=0.3, timeout=20)
 
     if ENABLE_TOOLS and TAVILY_AVAILABLE and os.environ.get("TAVILY_API_KEY"):
@@ -165,33 +124,27 @@ def _build_chain():
 def _polish(text: str) -> str:
     return text.strip()
 
-
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
 # Health
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
 @app.get("/healthz")
 def healthz():
-    flags = {
-        "LANGSMITH_BATCH_UPLOADS": os.environ.get("LANGSMITH_BATCH_UPLOADS"),
-        # these should be None/absent because we disabled auto tracing:
-        "LANGCHAIN_TRACING_V2": os.environ.get("LANGCHAIN_TRACING_V2"),
-        "LANGCHAIN_TRACING": os.environ.get("LANGCHAIN_TRACING"),
-    }
     return jsonify(
         ok=True,
         time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         model=ASK_LARRY_MODEL,
         tools=("on" if (ENABLE_TOOLS and TAVILY_AVAILABLE and os.environ.get("TAVILY_API_KEY")) else "off"),
         rate={"limit": RATE_LIMIT, "window_seconds": RATE_WINDOW_SECONDS},
-        ls_enabled=_LS_ENABLED,
-        ls_project=_LS_PROJECT if _LS_ENABLED else None,
-        tracing_env=flags,
+        tracing_env={
+            "LANGCHAIN_TRACING_V2": os.environ.get("LANGCHAIN_TRACING_V2"),
+            "LANGCHAIN_PROJECT": os.environ.get("LANGCHAIN_PROJECT"),
+            "LANGSMITH_BATCH_UPLOADS": os.environ.get("LANGSMITH_BATCH_UPLOADS"),
+        },
     )
 
-
-# --------------------------------------------------------------------
-# Ask Larry (main endpoint)
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
+# Ask Larry
+# ---------------------------------------------------------------
 @app.post("/ask")
 def ask():
     gate = _enforce_ios_only()
@@ -206,27 +159,22 @@ def ask():
     if not question:
         return jsonify(error="bad_request", reason="missing_question"), 400
 
-    # Start an explicit LangSmith run
-    run_id = _start_run("ask_larry", {"question": question})
-
     try:
         _require_openai_key()
 
         chain = _build_chain()
         text = _polish(chain.invoke({"question": question}))
 
-        # Finish + flush BEFORE returning (synchronous)
-        _finish_run(run_id, outputs={"text": text})
-
+        # 🔑 Make sure traces are uploaded before the function freezes
+        _flush_traces()
         return jsonify({"text": text})
 
     except Exception as e:
-        _finish_run(run_id, error=str(e))
+        _flush_traces()
         return jsonify(error="proxy_error", detail=str(e)), 502
 
-
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
 # Local dev
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "3000")), debug=True)
