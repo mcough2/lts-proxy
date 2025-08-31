@@ -1,6 +1,6 @@
 Flask
 requests
-langchain>=0.2.10
-langchain-openai>=0.1.22
-langchain-community>=0.2.10
+langchain>=0.2.15
+langchain-openai>=0.1.23
+langchain-community>=0.2.15
 tavily-python>=0.3.5
