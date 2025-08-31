@@ -6,45 +6,70 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 # --- LangChain / OpenAI ---
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# --- LangSmith: version-agnostic tracer shim ---------------------------------
-# Newer langsmith exposes get_langchain_tracer in run_helpers.
-# Older stacks need LangChainTracer from langchain.callbacks.tracers.
+# --- LangSmith: version-agnostic tracer + explicit flush ---------------------
+_LS_ENABLED = bool(os.environ.get("LANGSMITH_API_KEY"))
+_LS_CLIENT = None  # lazily created only if enabled
+
+
 def _make_tracer():
-    # Respect env – only create tracer when LANGSMITH_API_KEY is set.
-    if not os.environ.get("LANGSMITH_API_KEY"):
+    """Create a LangSmith tracer across client versions, or return None."""
+    if not _LS_ENABLED:
         return None
-    # Try modern import first
+    global _LS_CLIENT
+    # Make a client once (also gives us .flush()).
+    if _LS_CLIENT is None:
+        try:
+            from langsmith import Client  # type: ignore
+            _LS_CLIENT = Client()
+        except Exception:
+            _LS_CLIENT = None
+
+    # Try modern helper first
     try:
         from langsmith.run_helpers import get_langchain_tracer  # type: ignore
         return get_langchain_tracer()
     except Exception:
         pass
-    # Fallback: older LangChain tracer class
+
+    # Fallback to older LangChain tracer
     try:
         from langchain.callbacks.tracers import LangChainTracer  # type: ignore
         tracer = LangChainTracer()
-        # Older tracer may require loading default session; ignore if not present
         try:
-            tracer.load_default_session()  # type: ignore[attr-defined]
+            tracer.load_default_session()  # older API; ignore if absent
         except Exception:
             pass
         return tracer
     except Exception:
         return None
 
-# Optional Tavily search (used only if key is present)
+
+def _flush_traces_safely():
+    """Ensure traces are uploaded before the process exits."""
+    if _LS_CLIENT is None:
+        return
+    try:
+        # Newer clients expose flush(); older may no-op or raise—ignore errors.
+        _LS_CLIENT.flush()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+# --- Optional Tavily search (bind tools only if enabled) ---------------------
 try:
     from langchain_community.tools.tavily_search import TavilySearchResults
     TAVILY_AVAILABLE = True
 except Exception:
     TAVILY_AVAILABLE = False
+
+ENABLE_TOOLS = os.environ.get("ENABLE_TOOLS", "0") in ("1", "true", "TRUE")
 
 # --------------------------------------------------------------------------------------
 # Basic config
@@ -54,8 +79,6 @@ app = Flask(__name__)
 ASK_LARRY_MODEL = os.environ.get("ASK_LARRY_MODEL", "gpt-4o-mini")
 RATE_LIMIT = int(os.environ.get("ASK_LARRY_RATE_LIMIT", "10"))
 RATE_WINDOW_SECONDS = int(os.environ.get("ASK_LARRY_RATE_WINDOW", "60"))
-
-USE_TAVILY = bool(os.environ.get("TAVILY_API_KEY")) and TAVILY_AVAILABLE
 
 # Simple in-memory rate limiter (reset on cold start, fine for serverless)
 _rate_buckets: Dict[str, List[float]] = defaultdict(list)
@@ -109,7 +132,7 @@ def _rate_limit() -> Optional[tuple]:
 
 def _build_chain():
     """
-    Build the LCEL chain. If Tavily is configured, give the model a quick search tool.
+    Build the LCEL chain. Tools are off by default; enable with ENABLE_TOOLS=1.
     """
     system = (
         "You are Larry, the friendly ride assistant for the Le Tour De Shore iOS app. "
@@ -122,9 +145,10 @@ def _build_chain():
         ]
     )
 
-    llm = ChatOpenAI(model=ASK_LARRY_MODEL, temperature=0.3)
+    # Add a conservative timeout to avoid hanging runs in serverless.
+    llm = ChatOpenAI(model=ASK_LARRY_MODEL, temperature=0.3, timeout=20)
 
-    if USE_TAVILY:
+    if ENABLE_TOOLS and TAVILY_AVAILABLE and os.environ.get("TAVILY_API_KEY"):
         search = TavilySearchResults(k=3)
         llm = llm.bind_tools([search])
 
@@ -143,9 +167,9 @@ def healthz():
         ok=True,
         time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         model=ASK_LARRY_MODEL,
-        tools=("tavily" if USE_TAVILY else "none"),
+        tools=("on" if (ENABLE_TOOLS and TAVILY_AVAILABLE and os.environ.get("TAVILY_API_KEY")) else "off"),
         rate={"limit": RATE_LIMIT, "window_seconds": RATE_WINDOW_SECONDS},
-        tracing=("on" if os.environ.get("LANGSMITH_API_KEY") else "off"),
+        tracing=("on" if _LS_ENABLED else "off"),
     )
 
 # --------------------------------------------------------------------------------------
@@ -176,11 +200,17 @@ def ask():
         config = {"callbacks": [tracer]} if tracer else None
 
         text = chain.invoke({"question": question}, config=config)
-        return jsonify({"text": _polish(text)})
+        resp: Response = jsonify({"text": _polish(text)})
+
+        # IMPORTANT: flush traces before returning in serverless
+        _flush_traces_safely()
+        return resp
 
     except Exception as e:
         app.logger.exception("ask failed")
-        return jsonify(error="proxy_error", detail=str(e)), 502
+        resp_err: Response = jsonify(error="proxy_error", detail=str(e)), 502
+        _flush_traces_safely()
+        return resp_err
 
 # --------------------------------------------------------------------------------------
 # Flask entry (local dev)
