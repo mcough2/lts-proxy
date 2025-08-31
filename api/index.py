@@ -1,154 +1,176 @@
-# index.py — Ask Larry proxy with reliable LangSmith outputs
-import os, re, time, datetime
-from collections import defaultdict, deque
+# api/index.py
+import os
+import time
+import re
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+
 from flask import Flask, request, jsonify
 
-# --- LangSmith: make callbacks synchronous (no bg thread that can be killed early)
-os.environ.setdefault("LANGSMITH_TRACING_V2", "true")
-os.environ.setdefault("LANGSMITH_CALLBACKS_BACKGROUND", "false")
-
-# ---- LangChain / OpenAI ----
+# --- LangChain / OpenAI ---
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# ---- LangSmith client (to create a concrete tracer and flush it)
-from langsmith import Client
-from langsmith import traceable  # for a nice root run around the handler
+# --- LangSmith (tracing) ---
+from langsmith import traceable
+from langsmith.run_helpers import get_langchain_tracer  # <-- correct import
 
-# Optional: domain-limited search (set TAVILY_API_KEY to enable)
-USE_TAVILY = bool(os.environ.get("TAVILY_API_KEY"))
-if USE_TAVILY:
+# --- Optional Tavily search (used only if key is present) ---
+try:
     from langchain_community.tools.tavily_search import TavilySearchResults
-    from langchain.agents import create_openai_tools_agent, AgentExecutor
+    TAVILY_AVAILABLE = True
+except Exception:
+    TAVILY_AVAILABLE = False
 
+# --------------------------------------------------------------------------------------
+# Basic config
+# --------------------------------------------------------------------------------------
 app = Flask(__name__)
 
-# ------------------ Config ------------------
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
-if not OPENAI_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY")
+ASK_LARRY_MODEL = os.environ.get("ASK_LARRY_MODEL", "gpt-4o-mini")
+RATE_LIMIT = int(os.environ.get("ASK_LARRY_RATE_LIMIT", "10"))
+RATE_WINDOW_SECONDS = int(os.environ.get("ASK_LARRY_RATE_WINDOW", "60"))
 
-MODEL  = os.environ.get("ASK_LARRY_MODEL", "gpt-4o-mini")
-DOMAIN = "letourdeshore.com"
+USE_LANGSMITH = bool(os.environ.get("LANGSMITH_API_KEY"))
+USE_TAVILY = bool(os.environ.get("TAVILY_API_KEY")) and TAVILY_AVAILABLE
 
-SYSTEM = f"""You are Larry, a friendly assistant for the Le Tour de Shore charity ride.
-You always start each answer with two bird noises.
+# Simple in-memory rate limiter (reset on cold start, fine for serverless)
+_rate_buckets: Dict[str, list[float]] = defaultdict(list)
 
-If a search tool is available, use it to gather information ONLY from {DOMAIN}
-and pages linked from that site. Prefer primary sources and include at least one source link.
+BROWSER_UA_PAT = re.compile(r"(mozilla|safari|chrome|edge|firefox)", re.I)
 
-Answer concisely in Markdown. If you are not confident you found the answer on allowed pages,
-say so and suggest where to look on {DOMAIN}.
-"""
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
+def _require_openai_key():
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY not configured")
 
-# ------------------ In-memory rate limit (resets on cold start) ------------------
-RATE_LIMIT  = int(os.environ.get("ASK_LARRY_RATE_LIMIT", "10"))
-RATE_WINDOW = int(os.environ.get("ASK_LARRY_RATE_WINDOW", "60"))
-_reqlog: dict[str, list[float]] = defaultdict(list)
+def _client_id_from_headers() -> str:
+    # Required headers from the iOS app
+    instance_id = request.headers.get("X-LTS-InstanceId", "").strip()
+    return instance_id or request.remote_addr or "unknown"
 
-def is_rate_limited(key: str) -> bool:
+def _is_browser_user_agent() -> bool:
+    ua = request.headers.get("User-Agent", "")
+    return bool(BROWSER_UA_PAT.search(ua))
+
+def _enforce_ios_only() -> Optional[tuple]:
+    # Block obvious browsers & require our app headers
+    if _is_browser_user_agent():
+        return jsonify(error="forbidden", reason="browser_access_blocked"), 403
+    if request.headers.get("X-LTS-Client", "").lower() != "ios":
+        return jsonify(error="forbidden", reason="missing_or_invalid_client_header"), 403
+    if not request.headers.get("X-LTS-InstanceId"):
+        return jsonify(error="forbidden", reason="missing_instance_id"), 403
+    return None
+
+def _rate_limit() -> Optional[tuple]:
     now = time.time()
-    window_start = now - RATE_WINDOW
-    q = _reqlog[key]
-    while q and q[0] < window_start:
-        q.pop(0)
-    if len(q) >= RATE_LIMIT:
-        return True
-    q.append(now)
-    return False
+    key = _client_id_from_headers()
+    bucket = _rate_buckets[key]
+    # drop old events
+    cutoff = now - RATE_WINDOW_SECONDS
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= RATE_LIMIT:
+        return (
+            jsonify(
+                error="rate_limited",
+                limit=RATE_LIMIT,
+                window_seconds=RATE_WINDOW_SECONDS,
+            ),
+            429,
+        )
+    bucket.append(now)
+    return None
 
-# ------------------ Build the chain/agent once ------------------
-def build_chain():
-    llm = ChatOpenAI(
-        model=MODEL,
-        temperature=0.3,
-        timeout=45,
-        openai_api_key=OPENAI_KEY,
+def _build_chain():
+    """
+    Build the LCEL chain. If Tavily is configured, give the model a quick search tool.
+    """
+    system = (
+        "You are Larry, the friendly ride assistant for the Le Tour De Shore iOS app. "
+        "Answer clearly in concise Markdown. If you're unsure, say so briefly."
+    )
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system),
+            ("human", "{question}"),
+        ]
     )
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM),
-        ("human", "{question}")
-    ])
+    llm = ChatOpenAI(model=ASK_LARRY_MODEL, temperature=0.3)
 
     if USE_TAVILY:
-        search = TavilySearchResults(
-            max_results=5,
-            include_domains=[DOMAIN, f"www.{DOMAIN}"],
-            search_depth="advanced",
-        )
-        tools = [search]
-        agent = create_openai_tools_agent(llm, tools, prompt)
-        return AgentExecutor(agent=agent, tools=tools, verbose=False)
+        # Lightweight, top-3 web search when the model asks for it
+        search = TavilySearchResults(k=3)
+        # Bind tool for function-calling models; model will decide when to call
+        llm = llm.bind_tools([search])
 
-    return prompt | llm | StrOutputParser()
+    chain = prompt | llm | StrOutputParser()
+    return chain
 
-CHAIN = build_chain()
+def _polish(text: str) -> str:
+    # Tiny post-processor to keep things tidy for the chat bubble
+    return text.strip()
 
-# ------------------ Helpers ------------------
-def polish_markdown(md: str) -> str:
-    return re.sub(r"\s*\((?:https?://)?(?:www\.)?letourdeshore\.com\)\s*$", "", (md or "")).strip()
-
-@traceable(name="ask_larry", run_type="chain")
-def run_ask_larry(question: str, tracer) -> str:
-    """
-    Root-traced function. We pass an explicit LangSmith tracer into the chain so
-    the ChatOpenAI child run gets tied to THIS request and flushed synchronously.
-    """
-    if USE_TAVILY:
-        # AgentExecutor expects {"input": "..."}; returns dict with "output"
-        result = CHAIN.invoke({"input": question}, config={"callbacks": [tracer]})
-        text = result["output"] if isinstance(result, dict) and "output" in result else str(result)
-    else:
-        text = CHAIN.invoke({"question": question}, config={"callbacks": [tracer]})
-    return polish_markdown(text)
-
-# ------------------ Health ------------------
+# --------------------------------------------------------------------------------------
+# Health
+# --------------------------------------------------------------------------------------
 @app.get("/healthz")
 def healthz():
-    return jsonify({
-        "ok": True,
-        "model": MODEL,
-        "tools": "tavily" if USE_TAVILY else "none",
-        "rate": {"limit": RATE_LIMIT, "window_s": RATE_WINDOW},
-        "time": datetime.datetime.utcnow().isoformat() + "Z",
-    })
+    return jsonify(
+        ok=True,
+        time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        model=ASK_LARRY_MODEL,
+        tools=("tavily" if USE_TAVILY else "none"),
+        rate={"limit": RATE_LIMIT, "window_seconds": RATE_WINDOW_SECONDS},
+        tracing=("on" if USE_LANGSMITH else "off"),
+    )
 
-# ------------------ Main endpoint ------------------
+# --------------------------------------------------------------------------------------
+# Ask Larry
+# --------------------------------------------------------------------------------------
+@traceable(name="ask_larry_handler", run_type="chain")
 @app.post("/ask")
 def ask():
-    # iOS-only gate
-    client = (request.headers.get("X-LTS-Client") or "").lower()
-    instance_id = (request.headers.get("X-LTS-InstanceId") or "").strip()
-    ua = (request.headers.get("User-Agent") or "")
+    # Gate & rate-limit first
+    gate = _enforce_ios_only()
+    if gate:
+        return gate
+    rl = _rate_limit()
+    if rl:
+        return rl
 
-    if client != "ios" or not instance_id:
-        return jsonify(error="forbidden", detail="Missing or invalid client headers"), 403
-    if any(x in ua.lower() for x in ("mozilla", "safari", "chrome")):
-        return jsonify(error="forbidden", detail="Browser access blocked"), 403
-
-    if is_rate_limited(instance_id):
-        return jsonify(error="rate_limited",
-                       detail=f"Exceeded {RATE_LIMIT} requests per {RATE_WINDOW}s"), 429
-
-    data = request.get_json(silent=True) or {}
-    question = (data.get("question") or "").strip()
+    # Validate payload
+    payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    question = (payload.get("question") or "").strip()
     if not question:
-        return jsonify(error="bad_request", detail='Provide JSON {"question":"..."}'), 400
-
-    # Create a concrete tracer *for this request* and pass it to the chain
-    ls = Client()
-    tracer = ls.get_langchain_tracer()
+        return jsonify(error="bad_request", reason="missing_question"), 400
 
     try:
-        text = run_ask_larry(question=question, tracer=tracer)
-        return jsonify({"text": text})
+        _require_openai_key()
+
+        # Build chain once per invocation (fast enough for serverless)
+        chain = _build_chain()
+
+        # LangSmith tracer is a function, not a Client method
+        tracer = get_langchain_tracer() if USE_LANGSMITH else None
+        config = {"callbacks": [tracer]} if tracer else None
+
+        text = chain.invoke({"question": question}, config=config)
+        return jsonify({"text": _polish(text)})
+
     except Exception as e:
+        app.logger.exception("ask failed")
         return jsonify(error="proxy_error", detail=str(e)), 502
-    finally:
-        # Make sure all spans (including ChatOpenAI output) are uploaded now
-        try:
-            ls.flush()
-        except Exception:
-            pass
+
+# --------------------------------------------------------------------------------------
+# Flask entry (Vercel discovers app automatically)
+# --------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    # Local dev only
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "3000")), debug=True)
