@@ -1,5 +1,10 @@
 # api/index.py
 import os
+# --- Force LangSmith to upload synchronously in serverless ---
+os.environ.setdefault("LANGSMITH_BATCH_UPLOADS", "false")   # <-- key line
+# Optional, but helps ensure tracing hooks are active
+os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+
 import time
 import re
 from collections import defaultdict
@@ -13,7 +18,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# --- LangSmith (decorator + explicit flush; no callbacks) --------------------
+# --- LangSmith (decorator + explicit flush; no callbacks) ---
 from langsmith import traceable
 
 _LS_ENABLED = bool(os.environ.get("LANGSMITH_API_KEY"))
@@ -31,6 +36,7 @@ def _flush_traces_safely():
     if _LS_CLIENT is None:
         return
     try:
+        # Newer clients expose flush(); older may no-op—ignore errors.
         _LS_CLIENT.flush()  # type: ignore[attr-defined]
     except Exception:
         pass
@@ -142,6 +148,7 @@ def healthz():
         tools=("on" if (ENABLE_TOOLS and TAVILY_AVAILABLE and os.environ.get("TAVILY_API_KEY")) else "off"),
         rate={"limit": RATE_LIMIT, "window_seconds": RATE_WINDOW_SECONDS},
         tracing=("on" if _LS_ENABLED else "off"),
+        batch_uploads=os.environ.get("LANGSMITH_BATCH_UPLOADS"),
     )
 
 # --------------------------------------------------------------------------------------
