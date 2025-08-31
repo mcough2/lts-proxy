@@ -1,6 +1,13 @@
 # api/index.py
+# --- Tracing mode: explicit only (no auto LCEL tracing) ---
 import os
-# --- Force synchronous uploads for serverless ---
+
+# Kill auto LCEL tracing env if present so it can't create background runs
+for _k in ("LANGCHAIN_TRACING_V2", "LANGCHAIN_ENDPOINT", "LANGCHAIN_PROJECT"):
+    if _k in os.environ:
+        os.environ.pop(_k, None)
+
+# Force synchronous uploads for our explicit RunTree
 os.environ.setdefault("LANGSMITH_BATCH_UPLOADS", "false")
 
 import time
