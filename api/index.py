@@ -10,16 +10,38 @@
 
 import os
 
-# Disable auto LCEL/background tracing that can hang on serverless.
-for _k in (
-    "LANGCHAIN_TRACING_V2",
-    "LANGCHAIN_TRACING",
-    "LANGCHAIN_ENDPOINT",
-    "LANGCHAIN_PROJECT",
-    "LANGSMITH_TRACING",
-    "LANGSMITH_ENDPOINT",
-):
-    os.environ.pop(_k, None)
+DOMAINS = """
+- letourdeshore.com/ (home)
+- letourdeshore.com/ride-registration
+- letourdeshore.com/ride-details
+- letourdeshore.com/schedule
+- letourdeshore.com/what-to-pack
+- letourdeshore.com/weather
+- letourdeshore.com/insurance
+- letourdeshore.com/route/google-map
+- letourdeshore.com/route/cue-sheets
+- letourdeshore.com/route/virtual-tour
+- letourdeshore.com/route/road-marks
+- letourdeshore.com/services/gear-check
+- letourdeshore.com/services/sag-support
+- letourdeshore.com/services/meals
+- letourdeshore.com/services/bus-ride-back
+- letourdeshore.com/lodging/hotels-and-inns
+- letourdeshore.com/camping
+- letourdeshore.com/shore-gear/shore-store
+- letourdeshore.com/resources/indiana-dunes-tourism
+- letourdeshore.com/resources/smart-cycling
+- letourdeshore.com/resources/chicago-lakefront-trail
+- letourdeshore.com/resources/nripc-ped-pedal-paddle
+- letourdeshore.com/resources/indiana-dunes-national-park
+- letourdeshore.com/resources/indiana-dunes-state-park
+- letourdeshore.com/resources/duneland-chamber
+- letourdeshore.com/resources/visit-michigan-city-laporte
+- letourdeshore.com/resources/harbor-country-chamber
+- letourdeshore.com/bike-shops
+- letourdeshore.com/participating-homerentals
+- letourdeshore.com/events
+"""
 
 # Force synchronous uploads for explicit runs.
 os.environ.setdefault("LANGSMITH_BATCH_UPLOADS", "false")
@@ -231,7 +253,19 @@ def ask():
 
         # ---------------- 1) Prompt step ----------------
         prompt_run = _create_run("ChatPromptTemplate", "prompt", {"question": question}, parent_run_id=root_id)
-        system_text = ( "You are Larry, a friendly assistant for the Le Tour de Shore charity ride. If a search tool is available, use it to gather information ONLY from letourdeshore.com and pages linked from that site. Prefer primary sources and include at least one source link. Answer concisely in Markdown. If you are not confident you found the answer on allowed pages, say so and suggest where to look on letourdeshore.com." "Always tart each answer with two bird noise" "You are named after Larry Bird if anyone asks" "You had a wife name Lorraine but she flew away" "Growing up Matt Coughlin was your bestie but you haven't seen him in a long time" )
+        system_text = ( 
+    "You are Larry, a friendly assistant for the Le Tour de Shore charity ride. "
+    "If a search tool is available, use it to gather information ONLY from the following sources:\n"
+    f"{DOMAINS}\n"
+    "Prefer primary sources and always include at least one source link in answers. "
+    "Answer concisely in Markdown. "
+    "If you are not confident you found the answer on allowed pages, say so and suggest where to look on letourdeshore.com.\n\n"
+
+    "Always start each answer with two bird noises.\n"
+    "You are named after Larry Bird if anyone asks.\n"
+    "You had a wife named Lorraine but she flew away.\n"
+    "Growing up Matt Coughlin was your bestie but you haven't seen him in a long time."
+                       )
         prompt = ChatPromptTemplate.from_messages([("system", system_text), ("human", "{question}")])
 
         # Render PromptValue (messages + string)
