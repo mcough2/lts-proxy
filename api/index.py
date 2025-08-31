@@ -1,9 +1,7 @@
 # api/index.py
 import os
-# --- Force LangSmith to upload synchronously in serverless ---
-os.environ.setdefault("LANGSMITH_BATCH_UPLOADS", "false")   # <-- key line
-# Optional, but helps ensure tracing hooks are active
-os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+# --- Force synchronous uploads for serverless ---
+os.environ.setdefault("LANGSMITH_BATCH_UPLOADS", "false")
 
 import time
 import re
@@ -18,25 +16,37 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# --- LangSmith (decorator + explicit flush; no callbacks) ---
-from langsmith import traceable
-
+# --- LangSmith: explicit RunTree lifecycle (no callbacks/decorators) ----------
 _LS_ENABLED = bool(os.environ.get("LANGSMITH_API_KEY"))
+_LS_PROJECT = os.environ.get("LANGSMITH_PROJECT", "Le Tour De Shore")
 _LS_CLIENT = None
 if _LS_ENABLED:
     try:
         from langsmith import Client  # type: ignore
+        from langsmith.run_trees import RunTree  # type: ignore
         _LS_CLIENT = Client()
     except Exception:
         _LS_CLIENT = None
+        RunTree = None  # type: ignore
 
 
-def _flush_traces_safely():
-    """Ensure traces are uploaded before the process exits (serverless-safe)."""
-    if _LS_CLIENT is None:
+def _start_run_tree(name: str, inputs: Dict[str, Any]):
+    """Create a root RunTree if LangSmith is configured; otherwise None."""
+    if not (_LS_ENABLED and _LS_CLIENT and 'RunTree' in globals()):
+        return None
+    try:
+        return RunTree(name=name, run_type="chain", inputs=inputs, project_name=_LS_PROJECT)  # type: ignore
+    except Exception:
+        return None
+
+
+def _upload_run_tree(run):
+    """Upload the finished RunTree synchronously."""
+    if not (_LS_ENABLED and _LS_CLIENT and run is not None):
         return
     try:
-        # Newer clients expose flush(); older may no-op—ignore errors.
+        _LS_CLIENT.create_run_tree(run)  # type: ignore
+        # Ensure it leaves the process
         _LS_CLIENT.flush()  # type: ignore[attr-defined]
     except Exception:
         pass
@@ -116,7 +126,7 @@ def _build_chain():
         [("system", system), ("human", "{question}")]
     )
 
-    # Conservative timeout to avoid hanging in serverless
+    # Conservative timeout to avoid hangs in serverless
     llm = ChatOpenAI(model=ASK_LARRY_MODEL, temperature=0.3, timeout=20)
 
     if ENABLE_TOOLS and TAVILY_AVAILABLE and os.environ.get("TAVILY_API_KEY"):
@@ -127,14 +137,6 @@ def _build_chain():
 
 def _polish(text: str) -> str:
     return text.strip()
-
-# --------------------------------------------------------------------------------------
-# Traced run (no callbacks; closes synchronously)
-# --------------------------------------------------------------------------------------
-@traceable(name="ask_larry", run_type="chain")
-def _run_larry(question: str) -> str:
-    chain = _build_chain()
-    return _polish(chain.invoke({"question": question}))
 
 # --------------------------------------------------------------------------------------
 # Health
@@ -149,6 +151,7 @@ def healthz():
         rate={"limit": RATE_LIMIT, "window_seconds": RATE_WINDOW_SECONDS},
         tracing=("on" if _LS_ENABLED else "off"),
         batch_uploads=os.environ.get("LANGSMITH_BATCH_UPLOADS"),
+        project=_LS_PROJECT if _LS_ENABLED else None,
     )
 
 # --------------------------------------------------------------------------------------
@@ -156,6 +159,7 @@ def healthz():
 # --------------------------------------------------------------------------------------
 @app.post("/ask")
 def ask():
+    # Gate / rate limit
     gate = _enforce_ios_only()
     if gate:
         return gate
@@ -163,22 +167,43 @@ def ask():
     if rl:
         return rl
 
+    # Payload
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
     question = (payload.get("question") or "").strip()
     if not question:
         return jsonify(error="bad_request", reason="missing_question"), 400
 
+    run = _start_run_tree("ask_larry", {"question": question})
+
     try:
         _require_openai_key()
-        text = _run_larry(question)
+        chain = _build_chain()
+
+        # Invoke model
+        text = chain.invoke({"question": question})
+        text = _polish(text)
+
+        # Record outputs on the run (if enabled)
+        if run is not None:
+            run.add_outputs({"text": text})
+            run.end()
+
         resp: Response = jsonify({"text": text})
         return resp
+
     except Exception as e:
+        # Close the run with error (if enabled)
+        if run is not None:
+            try:
+                run.end(error=str(e))
+            except Exception:
+                pass
         app.logger.exception("ask failed")
         return jsonify(error="proxy_error", detail=str(e)), 502
+
     finally:
-        # Ensure traces upload before the serverless process freezes
-        _flush_traces_safely()
+        # Synchronous upload so the run never stays 'Pending'
+        _upload_run_tree(run)
 
 # --------------------------------------------------------------------------------------
 # Local dev entry
